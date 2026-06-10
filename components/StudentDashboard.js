@@ -27,6 +27,9 @@ import { useAuth } from "@/hooks/useAuth";
 import { useAttendance } from "@/hooks/useAttendance";
 import { useCurriculum } from "@/hooks/useCurriculum";
 import { useIsMounted } from "@/hooks/useIsMounted";
+import EngagementScoreCard from "@/components/EngagementScoreCard";
+import EngagementTrendChart from "@/components/EngagementTrendChart";
+import EngagementBreakdown from "@/components/EngagementBreakdown";
 
 const AchievementSection = dynamic(() => import("./AchievementSection"), {
   ssr: false,
@@ -44,8 +47,12 @@ const AttendanceChart = dynamic(() => import("./AttendanceChart"), {
 });
 
 import { weeklySchedule } from "@/constants/mockData";
+import { calculateEngagementScore, getEngagementCategory } from "@/lib/engagementScore";
 
 import AttendanceAnalytics from "./dashboard/AttendanceAnalytics";
+import EngagementScoreCard from "./EngagementScoreCard";
+import EngagementTrendChart from "./EngagementTrendChart";
+import EngagementBreakdown from "./EngagementBreakdown";
 import StreakCounter from "./gamification/StreakCounter";
 import XpProgressBar from "./gamification/XpProgressBar";
 import BadgeGallery from "./gamification/BadgeGallery";
@@ -242,6 +249,10 @@ const StudentDashboard = () => {
   const [showComplaint, setShowComplaint] = useState(false);
   const [skillPath, setSkillPath] = useState("standard");
   const [showDiagnosticQuiz, setShowDiagnosticQuiz] = useState(false);
+  const [engagementHistory, setEngagementHistory] = useState([]);
+  const [engagementRecord, setEngagementRecord] = useState(null);
+  const [engagementError, setEngagementError] = useState(null);
+  const [engagementSaved, setEngagementSaved] = useState(false);
   const lastScheduleTickRef = useRef(getScheduleTickKey(new Date()));
 
   const attendanceStats = useMemo(() => {
@@ -282,6 +293,93 @@ const StudentDashboard = () => {
       streakDays: gamificationData?.currentStreak ?? 0,
     };
   }, [attendanceStats, gamificationData]);
+
+  const activityParticipationScore = useMemo(() => {
+    return Math.min(100, Math.round((recentActivity.length / 10) * 100));
+  }, [recentActivity.length]);
+
+  const assignmentSubmissionScore = useMemo(() => {
+    return Math.min(100, Math.round((recentActivity.filter((item) => item?.status === "present").length / 8) * 100));
+  }, [recentActivity]);
+
+  const academicPerformanceScore = useMemo(() => {
+    const totalXp = gamificationData?.totalXp ?? 0;
+    return Math.min(100, Math.round((totalXp / 1200) * 100));
+  }, [gamificationData]);
+
+  const engagementMetrics = useMemo(() => {
+    return calculateEngagementScore({
+      attendanceScore: attendanceStats?.percentage ?? 0,
+      activityScore: activityParticipationScore,
+      assignmentScore: assignmentSubmissionScore,
+      academicScore: academicPerformanceScore,
+    });
+  }, [attendanceStats?.percentage, activityParticipationScore, assignmentSubmissionScore, academicPerformanceScore]);
+
+  useEffect(() => {
+    if (!user?.uid) return;
+
+    const controller = new AbortController();
+
+    const fetchEngagement = async () => {
+      try {
+        setEngagementError(null);
+        const token = await user.getIdToken();
+        const response = await fetch(
+          `/api/engagement-scores?studentId=${encodeURIComponent(user.uid)}&limit=12`,
+          {
+            signal: controller.signal,
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
+        if (!response.ok) {
+          throw new Error(`Unable to load engagement data: ${response.status}`);
+        }
+        const payload = await response.json();
+        setEngagementHistory(payload?.data?.history || []);
+        setEngagementRecord(payload?.data?.latest || null);
+      } catch (err) {
+        if (err.name !== "AbortError") {
+          setEngagementError(err.message);
+        }
+      }
+    };
+
+    fetchEngagement();
+
+    return () => controller.abort();
+  }, [user?.uid]);
+
+  useEffect(() => {
+    if (!user?.uid || engagementSaved || !engagementMetrics) return;
+
+    const persistEngagement = async () => {
+      try {
+        const token = await user.getIdToken();
+        await fetch("/api/engagement-scores", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            studentId: user.uid,
+            attendanceScore: engagementMetrics.attendanceScore,
+            activityScore: engagementMetrics.activityScore,
+            assignmentScore: engagementMetrics.assignmentScore,
+            academicScore: engagementMetrics.academicScore,
+          }),
+        });
+        setEngagementSaved(true);
+      } catch {
+        // Do not block dashboard if persistence fails.
+      }
+    };
+
+    persistEngagement();
+  }, [user?.uid, engagementMetrics, engagementSaved]);
 
   const scheduleState = useMemo(
     () => getTodaySchedule(scheduleTime, weeklySchedule),
@@ -450,6 +548,29 @@ const StudentDashboard = () => {
           <ExportDropdown onExport={handleExportAttendance} />
         </div>
         <AttendanceInsights recentActivity={recentActivity} />
+      </div>
+
+      <div className="max-w-7xl mx-auto mt-8 px-6">
+        <div className="grid gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
+          <EngagementScoreCard
+            overallScore={engagementMetrics.overallScore}
+            attendanceScore={engagementMetrics.attendanceScore}
+            activityScore={engagementMetrics.activityScore}
+            assignmentScore={engagementMetrics.assignmentScore}
+            academicScore={engagementMetrics.academicScore}
+          />
+          <div className="space-y-6">
+            <EngagementTrendChart history={engagementHistory} />
+            <EngagementBreakdown
+              breakdown={[
+                { label: "Attendance", value: engagementMetrics.attendanceScore },
+                { label: "Activity Participation", value: engagementMetrics.activityScore },
+                { label: "Assignment Submissions", value: engagementMetrics.assignmentScore },
+                { label: "Academic Performance", value: engagementMetrics.academicScore },
+              ]}
+            />
+          </div>
+        </div>
       </div>
 
       {/* Digital Certificates & Achievements */}
